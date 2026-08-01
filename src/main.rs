@@ -261,7 +261,10 @@ impl Framebuffer {
         };
         if ptr == MAP_FAILED {
             return Err(format!(
-                "framebuffer mmap failed: {}",
+                "framebuffer mmap failed for {len} bytes at {stride}-byte stride \
+                 ({}/{} virtual): {}",
+                var.xres_virtual,
+                var.yres_virtual,
                 std::io::Error::last_os_error()
             ));
         }
