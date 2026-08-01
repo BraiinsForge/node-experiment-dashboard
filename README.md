@@ -13,7 +13,9 @@ The screen shows:
 - uptime, load, RAM, swap, SSD mount, and framebuffer geometry;
 - compact rolling load, memory, swap, and chain-sync bar charts;
 - Bitcoin Core v31.0 chain height, headers, verification state, peers, archive
-  state, and on-disk size;
+  state, on-disk size, and resident RAM;
+- `STARTING`, `RUNNING`, and `ONLINE` status transitions as the process and RPC
+  become available;
 - a short raw-transaction submission reminder. It never handles private keys
   and does not submit transactions itself.
 
@@ -35,6 +37,12 @@ The scanout needs only a 1.2 MiB logical RGB565 canvas and a reusable 960-byte
 row staging buffer. Four 80-sample bar histories add only 320 bytes. The staged
 bulk copy avoids corrupt partial framebuffer writes and keeps the display
 readable without a terminal emulator or graphics stack.
+
+## Visual language
+
+The display reuses RetroDeck dashboard colors: `#1c1c1c` surface,
+`#303030` controls, `#5f87af` information, `#87af87` healthy state,
+`#ffffaf` pending state, `#af8787` fault state, and `#fe6c27` accent.
 
 ## Build
 

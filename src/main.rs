@@ -27,16 +27,17 @@ fn physical_position(logical_x: usize, logical_y: usize) -> (usize, usize) {
     (PHYSICAL_HEIGHT - 1 - logical_x, logical_y)
 }
 
-const BLACK: Color = Color::new(5, 8, 14);
-const PANEL: Color = Color::new(12, 18, 29);
-const PANEL_ALT: Color = Color::new(16, 24, 38);
-const WHITE: Color = Color::new(226, 235, 244);
-const MUTED: Color = Color::new(137, 157, 177);
-const CYAN: Color = Color::new(65, 202, 220);
-const GREEN: Color = Color::new(76, 211, 141);
-const AMBER: Color = Color::new(242, 183, 76);
-const RED: Color = Color::new(238, 92, 92);
-const BLUE: Color = Color::new(84, 145, 235);
+// RetroDeck dashboard palette: surface, controls, Wi-Fi, volume, title, accent.
+const BLACK: Color = Color::new(0, 0, 0);
+const PANEL: Color = Color::new(28, 28, 28);
+const PANEL_ALT: Color = Color::new(48, 48, 48);
+const WHITE: Color = Color::new(238, 238, 238);
+const MUTED: Color = Color::new(148, 148, 148);
+const CYAN: Color = Color::new(95, 135, 175);
+const GREEN: Color = Color::new(135, 175, 135);
+const AMBER: Color = Color::new(255, 255, 175);
+const RED: Color = Color::new(175, 135, 135);
+const BLUE: Color = Color::new(254, 108, 39);
 
 unsafe extern "C" {
     fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
@@ -314,6 +315,7 @@ struct Machine {
 struct Node {
     rpc_ok: bool,
     process_alive: bool,
+    resident_kib: u64,
     blocks: u64,
     headers: u64,
     verification: f64,
@@ -501,7 +503,9 @@ impl ChainCache {
             self.snapshot = Some(Node::poll(network_cache));
         }
         let mut node = self.snapshot.clone().unwrap_or_else(Node::unavailable);
-        node.process_alive = core_process_alive();
+        let core_rss = core_process_rss_kib();
+        node.process_alive = core_rss.is_some();
+        node.resident_kib = core_rss.unwrap_or(0);
         if !node.process_alive {
             node.rpc_ok = false;
         }
@@ -509,31 +513,42 @@ impl ChainCache {
     }
 }
 
-fn core_process_alive() -> bool {
-    let entries = match std::fs::read_dir("/proc") {
-        Ok(entries) => entries,
-        Err(_) => return false,
-    };
-    entries.filter_map(Result::ok).any(|entry| {
+fn status_kib(text: &str, key: &str) -> Option<u64> {
+    text.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        (name == key)
+            .then(|| value.split_whitespace().next()?.parse::<u64>().ok())
+            .flatten()
+    })
+}
+
+fn core_process_rss_kib() -> Option<u64> {
+    let entries = std::fs::read_dir("/proc").ok()?;
+    entries.filter_map(Result::ok).find_map(|entry| {
         let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if !name.bytes().all(|byte| byte.is_ascii_digit()) {
-            return false;
+        if !name
+            .to_string_lossy()
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
+        {
+            return None;
         }
-        let path = entry.path().join("cmdline");
-        let command = match std::fs::read_to_string(path) {
-            Ok(command) => command,
-            Err(_) => return false,
-        };
-        command.contains("/bitcoind")
+        let command = std::fs::read_to_string(entry.path().join("cmdline")).ok()?;
+        if !command.contains("/bitcoind") {
+            return None;
+        }
+        let status = std::fs::read_to_string(entry.path().join("status")).ok()?;
+        status_kib(&status, "VmRSS")
     })
 }
 
 impl Node {
     fn unavailable() -> Self {
+        let core_rss = core_process_rss_kib();
         Self {
             rpc_ok: false,
-            process_alive: core_process_alive(),
+            process_alive: core_rss.is_some(),
+            resident_kib: core_rss.unwrap_or(0),
             blocks: 0,
             headers: 0,
             verification: 0.0,
@@ -559,6 +574,7 @@ impl Node {
         Self {
             rpc_ok: true,
             process_alive: true,
+            resident_kib: core_process_rss_kib().unwrap_or(0),
             blocks: json_u64(&chain, "blocks").unwrap_or(0),
             headers: json_u64(&chain, "headers").unwrap_or(0),
             verification: json_f64(&chain, "verificationprogress").unwrap_or(0.0),
@@ -922,7 +938,14 @@ fn render(fb: &mut Framebuffer, snapshot: &Snapshot, history: &MetricHistory) {
 
     let text_x = right_x + 4 * scale;
     let mut y = body_y + 17 * scale;
-    draw_line(fb, text_x, y, "CORE v31.0.0", WHITE, scale);
+    draw_line(
+        fb,
+        text_x,
+        y,
+        &format!("CORE v31.0.0  RAM {}M", snapshot.node.resident_kib / 1024),
+        WHITE,
+        scale,
+    );
     y += line;
     draw_line(
         fb,
@@ -1261,5 +1284,14 @@ mod tests {
         assert_eq!(samples[HISTORY_SAMPLES - 1], 99);
         assert_eq!(percent(1, 0), 0);
         assert_eq!(percent(3, 4), 75);
+    }
+
+    #[test]
+    fn reads_core_resident_memory_from_proc_status() {
+        assert_eq!(
+            status_kib("Name:\tbitcoind\nVmRSS:\t115712 kB\n", "VmRSS"),
+            Some(115712)
+        );
+        assert_eq!(status_kib("Name:\tbitcoind\n", "VmRSS"), None);
     }
 }
