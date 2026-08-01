@@ -2,6 +2,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
+use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -50,6 +52,76 @@ unsafe extern "C" {
         offset: c_long,
     ) -> *mut c_void;
     fn munmap(addr: *mut c_void, length: usize) -> c_int;
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct InputEvent {
+    sec: c_long,
+    usec: c_long,
+    kind: u16,
+    code: u16,
+    value: i32,
+}
+
+struct Touch {
+    file: File,
+    x: usize,
+    y: usize,
+    down: bool,
+    reported_down: bool,
+    pressed_bmc: bool,
+}
+impl Touch {
+    fn open() -> Option<Self> {
+        Some(Self {
+            file: OpenOptions::new()
+                .read(true)
+                .custom_flags(0x800)
+                .open("/dev/input/event0")
+                .ok()?,
+            x: 0,
+            y: 0,
+            down: false,
+            reported_down: false,
+            pressed_bmc: false,
+        })
+    }
+    fn bmc_pressed(&mut self) -> bool {
+        let mut bytes = [0u8; std::mem::size_of::<InputEvent>()];
+        loop {
+            match self.file.read(&mut bytes) {
+                Ok(n) if n == bytes.len() => {
+                    let event =
+                        unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<InputEvent>()) };
+                    match (event.kind, event.code) {
+                        (3, 0) => self.x = event.value.clamp(0, 1279) as usize,
+                        (3, 1) => self.y = event.value.clamp(0, 479) as usize,
+                        (1, 330) => self.down = event.value != 0,
+                        (0, 0) => {
+                            if self.down && !self.reported_down {
+                                self.pressed_bmc = self.x >= 180 && self.x < 340 && self.y < 36;
+                            }
+                            let activate = !self.down
+                                && self.reported_down
+                                && self.pressed_bmc
+                                && self.x >= 180
+                                && self.x < 340
+                                && self.y < 36;
+                            self.reported_down = self.down;
+                            if activate {
+                                return true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(_) => return false,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return false,
+                Err(_) => return false,
+            }
+        }
+    }
 }
 
 #[repr(C)]
@@ -866,6 +938,8 @@ fn render(fb: &mut Framebuffer, snapshot: &Snapshot, history: &MetricHistory) {
     fb.rect(0, 0, fb.width, header_h, PANEL_ALT);
     fb.rect(0, header_h.saturating_sub(scale), fb.width, scale, BLUE);
     fb.text(margin, 5 * scale, "BITCOIN NODE", scale, WHITE);
+    fb.rect(180, 4, 160, header_h.saturating_sub(8), BLUE);
+    fb.text(192, 10, "BMC MODE", scale, BLACK);
     let status = if snapshot.node.rpc_ok {
         "ONLINE"
     } else if snapshot.node.process_alive {
@@ -1314,11 +1388,18 @@ fn main() {
         return;
     }
     let mut dashboard = Dashboard::new();
+    let mut touch = Touch::open();
     loop {
         let started = Instant::now();
         let snapshot = dashboard.collect();
         render(&mut framebuffer, &snapshot, &dashboard.history);
         framebuffer.publish();
+        if touch.as_mut().is_some_and(Touch::bmc_pressed) {
+            let _ = Command::new("/mnt/bitcoin-node/runtime/node-mode")
+                .arg("bmc")
+                .spawn();
+            break;
+        }
         let elapsed = started.elapsed();
         if elapsed < Duration::from_secs(DASHBOARD_TICK_SECS) {
             thread::sleep(Duration::from_secs(DASHBOARD_TICK_SECS) - elapsed);
