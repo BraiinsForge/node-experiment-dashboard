@@ -864,6 +864,7 @@ fn render(fb: &mut Framebuffer, snapshot: &Snapshot, history: &MetricHistory) {
 
     let header_h = 18 * scale;
     fb.rect(0, 0, fb.width, header_h, PANEL_ALT);
+    fb.rect(0, header_h.saturating_sub(scale), fb.width, scale, BLUE);
     fb.text(margin, 5 * scale, "BITCOIN NODE", scale, WHITE);
     let status = if snapshot.node.rpc_ok {
         "ONLINE"
@@ -1073,7 +1074,7 @@ fn render(fb: &mut Framebuffer, snapshot: &Snapshot, history: &MetricHistory) {
     );
 
     let help_y = body_y + panel_h + panel_gap;
-    let help_h = fb.height.saturating_sub(help_y + 16 * scale + margin);
+    let help_h = fb.height.saturating_sub(help_y + margin);
     let total_w = fb.width.saturating_sub(margin * 2);
     let history_w = total_w.saturating_mul(3) / 5;
     let transaction_x = margin + history_w + panel_gap;
@@ -1223,23 +1224,6 @@ fn render(fb: &mut Framebuffer, snapshot: &Snapshot, history: &MetricHistory) {
             scale,
         );
     }
-
-    let footer_y = fb.height.saturating_sub(10 * scale);
-    fb.rect(
-        0,
-        footer_y.saturating_sub(2 * scale),
-        fb.width,
-        2 * scale,
-        BLUE,
-    );
-    draw_line(
-        fb,
-        margin,
-        footer_y,
-        "DIRECT FBDEV  3s DRAW  30s RPC  SIGTERM TO EXIT",
-        MUTED,
-        scale,
-    );
 }
 
 fn glyph(byte: u8) -> [u8; 5] {
