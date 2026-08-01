@@ -312,6 +312,43 @@ struct Machine {
 }
 
 #[derive(Clone)]
+struct Mempool {
+    available: bool,
+    entries: u64,
+    bytes: u64,
+    usage: u64,
+    limit: u64,
+    min_fee: f64,
+    unbroadcast: u64,
+}
+
+impl Mempool {
+    fn unavailable() -> Self {
+        Self {
+            available: false,
+            entries: 0,
+            bytes: 0,
+            usage: 0,
+            limit: 0,
+            min_fee: 0.0,
+            unbroadcast: 0,
+        }
+    }
+
+    fn from_rpc(body: &str) -> Self {
+        Self {
+            available: true,
+            entries: json_u64(body, "size").unwrap_or(0),
+            bytes: json_u64(body, "bytes").unwrap_or(0),
+            usage: json_u64(body, "usage").unwrap_or(0),
+            limit: json_u64(body, "maxmempool").unwrap_or(0),
+            min_fee: json_f64(body, "mempoolminfee").unwrap_or(0.0),
+            unbroadcast: json_u64(body, "unbroadcastcount").unwrap_or(0),
+        }
+    }
+}
+
+#[derive(Clone)]
 struct Node {
     rpc_ok: bool,
     process_alive: bool,
@@ -324,6 +361,7 @@ struct Node {
     connections: u64,
     network_active: bool,
     disk_bytes: u64,
+    mempool: Mempool,
 }
 
 struct Snapshot {
@@ -360,7 +398,6 @@ struct MetricHistory {
     load: Vec<u8>,
     memory: Vec<u8>,
     swap: Vec<u8>,
-    sync: Vec<u8>,
 }
 
 impl MetricHistory {
@@ -369,7 +406,6 @@ impl MetricHistory {
             load: Vec::with_capacity(HISTORY_SAMPLES),
             memory: Vec::with_capacity(HISTORY_SAMPLES),
             swap: Vec::with_capacity(HISTORY_SAMPLES),
-            sync: Vec::with_capacity(HISTORY_SAMPLES),
         }
     }
 
@@ -388,14 +424,6 @@ impl MetricHistory {
         push_sample(
             &mut self.swap,
             percent(snapshot.machine.swap_used, snapshot.machine.swap_total),
-        );
-        push_sample(
-            &mut self.sync,
-            if snapshot.node.rpc_ok {
-                (snapshot.node.verification * 100.0) as u8
-            } else {
-                0
-            },
         );
     }
 }
@@ -557,6 +585,7 @@ impl Node {
             connections: 0,
             network_active: false,
             disk_bytes: 0,
+            mempool: Mempool::unavailable(),
         }
     }
 
@@ -570,6 +599,10 @@ impl Node {
             Ok(body) => body,
             Err(_) => return Self::unavailable(),
         };
+        let mempool = rpc
+            .call("getmempoolinfo")
+            .map(|body| Mempool::from_rpc(&body))
+            .unwrap_or_else(|_| Mempool::unavailable());
         network_cache.refresh(&rpc);
         Self {
             rpc_ok: true,
@@ -583,6 +616,7 @@ impl Node {
             connections: network_cache.connections,
             network_active: network_cache.active,
             disk_bytes: json_u64(&chain, "size_on_disk").unwrap_or(0),
+            mempool,
         }
     }
 }
@@ -799,6 +833,22 @@ fn draw_history(
             bar_height,
             color,
         );
+    }
+}
+
+fn draw_meter(
+    fb: &mut Framebuffer,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+    value: u8,
+    color: Color,
+) {
+    fb.rect(x, y, width, height, BLACK);
+    let filled = width.saturating_mul(value as usize) / 100;
+    if filled > 0 {
+        fb.rect(x, y, filled, height, color);
     }
 }
 
@@ -1035,7 +1085,7 @@ fn render(fb: &mut Framebuffer, snapshot: &Snapshot, history: &MetricHistory) {
         help_y,
         transaction_w,
         help_h,
-        "RAW TRANSACTION",
+        "MEMPOOL",
         scale,
     );
 
@@ -1094,35 +1144,85 @@ fn render(fb: &mut Framebuffer, snapshot: &Snapshot, history: &MetricHistory) {
         scale,
     );
 
-    let guide_x = transaction_x + 4 * scale;
-    let guide_chars = transaction_w.saturating_sub(8 * scale) / (6 * scale).max(1);
-    let mut guide_y = help_y + 17 * scale;
-    for (text, color) in [
-        ("1 SIGN OFFLINE", CYAN),
-        ("2 bitcoin-cli sendrawtransaction HEX", WHITE),
-        ("3 bitcoin-cli getmempoolentry TXID", WHITE),
-        ("KEYS STAY OFF THIS NODE", AMBER),
-    ] {
-        draw_line(fb, guide_x, guide_y, &fit(text, guide_chars), color, scale);
-        guide_y += line;
+    let mempool_x = transaction_x + 4 * scale;
+    let mempool_w = transaction_w.saturating_sub(8 * scale);
+    let mempool = &snapshot.node.mempool;
+    if mempool.available {
+        draw_line(
+            fb,
+            mempool_x,
+            help_y + 17 * scale,
+            &format!(
+                "TXS {}  BYTES {}",
+                mempool.entries,
+                format_size(mempool.bytes)
+            ),
+            WHITE,
+            scale,
+        );
+        draw_line(
+            fb,
+            mempool_x,
+            help_y + 26 * scale,
+            &format!(
+                "USAGE {} / {}",
+                format_size(mempool.usage),
+                format_size(mempool.limit)
+            ),
+            CYAN,
+            scale,
+        );
+        draw_meter(
+            fb,
+            mempool_x,
+            help_y + 35 * scale,
+            mempool_w,
+            5 * scale,
+            percent(mempool.usage, mempool.limit),
+            CYAN,
+        );
+        draw_line(
+            fb,
+            mempool_x,
+            help_y + 45 * scale,
+            &format!("MIN FEE {:.2} SAT/VB", mempool.min_fee * 100_000.0),
+            AMBER,
+            scale,
+        );
+        draw_line(
+            fb,
+            mempool_x,
+            help_y + 54 * scale,
+            &format!("UNBROADCAST {}", mempool.unbroadcast),
+            MUTED,
+            scale,
+        );
+    } else {
+        draw_line(
+            fb,
+            mempool_x,
+            help_y + 17 * scale,
+            "MEMPOOL WAITING",
+            AMBER,
+            scale,
+        );
+        draw_line(
+            fb,
+            mempool_x,
+            help_y + 26 * scale,
+            "CORE RPC UNAVAILABLE",
+            MUTED,
+            scale,
+        );
+        draw_line(
+            fb,
+            mempool_x,
+            help_y + 35 * scale,
+            "RETRY AT NEXT 30S POLL",
+            MUTED,
+            scale,
+        );
     }
-    draw_line(
-        fb,
-        guide_x,
-        help_y + 57 * scale,
-        "SYNC HISTORY",
-        GREEN,
-        scale,
-    );
-    draw_history(
-        fb,
-        guide_x,
-        help_y + 66 * scale,
-        transaction_w.saturating_sub(8 * scale),
-        20 * scale,
-        &history.sync,
-        if snapshot.node.ibd { AMBER } else { GREEN },
-    );
 
     let footer_y = fb.height.saturating_sub(10 * scale);
     fb.rect(
@@ -1258,6 +1358,20 @@ mod tests {
     #[test]
     fn cookie_auth_encoding_is_stable() {
         assert_eq!(base64(b"__cookie__:abc"), "X19jb29raWVfXzphYmM=");
+    }
+
+    #[test]
+    fn parses_mempool_statistics() {
+        let mempool = Mempool::from_rpc(
+            r#"{"size":17,"bytes":4920,"usage":18432,"maxmempool":5000000,"mempoolminfee":0.00001000,"unbroadcastcount":2}"#,
+        );
+        assert!(mempool.available);
+        assert_eq!(mempool.entries, 17);
+        assert_eq!(mempool.bytes, 4920);
+        assert_eq!(mempool.usage, 18432);
+        assert_eq!(mempool.limit, 5_000_000);
+        assert_eq!(mempool.min_fee, 0.00001);
+        assert_eq!(mempool.unbroadcast, 2);
     }
 
     #[test]

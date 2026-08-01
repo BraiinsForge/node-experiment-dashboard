@@ -16,8 +16,9 @@ The screen shows:
   state, on-disk size, and resident RAM;
 - `STARTING`, `RUNNING`, and `ONLINE` status transitions as the process and RPC
   become available;
-- a short raw-transaction submission reminder. It never handles private keys
-  and does not submit transactions itself.
+- bounded 30-second mempool snapshots: transaction count, serialized bytes,
+  allocator usage, configured limit, fee floor, and unbroadcast count. It never
+  handles private keys or submits transactions.
 
 The node is expected to use cookie authentication at
 `/mnt/bitcoin-node/.cookie` and RPC at `127.0.0.1:8332`.
@@ -34,7 +35,7 @@ physical column = logical y
 ```
 
 The scanout needs only a 1.2 MiB logical RGB565 canvas and a reusable 960-byte
-row staging buffer. Four 80-sample bar histories add only 320 bytes. The staged
+row staging buffer. Three 80-sample bar histories add only 240 bytes. The staged
 bulk copy avoids corrupt partial framebuffer writes and keeps the display
 readable without a terminal emulator or graphics stack.
 
