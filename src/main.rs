@@ -260,7 +260,10 @@ impl Framebuffer {
             )
         };
         if ptr == MAP_FAILED {
-            return Err("framebuffer mmap failed".to_string());
+            return Err(format!(
+                "framebuffer mmap failed: {}",
+                std::io::Error::last_os_error()
+            ));
         }
         Ok(Self {
             _file: file,
