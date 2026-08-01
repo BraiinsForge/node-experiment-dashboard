@@ -4,12 +4,14 @@ A small Rust framebuffer dashboard for the Braiins Deck node mode.
 
 It intentionally avoids GTK, SDL, Wayland, a JSON crate, a service framework,
 and a graphics dependency. The release binary opens `/dev/fb0`, maps the
-existing framebuffer, draws a fixed 5x7 font at a readable 2x scale, and polls
-Bitcoin Core's loopback RPC every 30 seconds.
+existing framebuffer, draws a fixed 5x7 font at a readable 2x scale, refreshes
+machine charts every three seconds, and polls Bitcoin Core's loopback RPC every
+30 seconds.
 
 The screen shows:
 
 - uptime, load, RAM, swap, SSD mount, and framebuffer geometry;
+- compact rolling load, memory, swap, and chain-sync bar charts;
 - Bitcoin Core v31.0 chain height, headers, verification state, peers, archive
   state, and on-disk size;
 - a short raw-transaction submission reminder. It never handles private keys
@@ -30,9 +32,9 @@ physical column = logical y
 ```
 
 The scanout needs only a 1.2 MiB logical RGB565 canvas and a reusable 960-byte
-row staging buffer. The staged bulk copy avoids corrupt partial framebuffer
-writes and keeps the display readable without a terminal emulator or graphics
-stack.
+row staging buffer. Four 80-sample bar histories add only 320 bytes. The staged
+bulk copy avoids corrupt partial framebuffer writes and keeps the display
+readable without a terminal emulator or graphics stack.
 
 ## Build
 

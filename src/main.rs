@@ -17,6 +17,9 @@ const LOGICAL_WIDTH: usize = 1280;
 const LOGICAL_HEIGHT: usize = 480;
 const PHYSICAL_WIDTH: usize = 600;
 const PHYSICAL_HEIGHT: usize = 1280;
+const DASHBOARD_TICK_SECS: u64 = 3;
+const CHAIN_POLL_SECS: u64 = 30;
+const HISTORY_SAMPLES: usize = 80;
 
 #[inline]
 fn physical_position(logical_x: usize, logical_y: usize) -> (usize, usize) {
@@ -299,6 +302,7 @@ impl Drop for Framebuffer {
 struct Machine {
     uptime_seconds: u64,
     load: String,
+    load_one: f32,
     mem_available: u64,
     mem_total: u64,
     swap_used: u64,
@@ -306,6 +310,7 @@ struct Machine {
     disk_mounted: bool,
 }
 
+#[derive(Clone)]
 struct Node {
     rpc_ok: bool,
     process_alive: bool,
@@ -326,21 +331,85 @@ struct Snapshot {
 
 struct Dashboard {
     network: NetworkCache,
+    chain: ChainCache,
+    history: MetricHistory,
 }
 
 impl Dashboard {
     fn new() -> Self {
         Self {
             network: NetworkCache::new(),
+            chain: ChainCache::new(),
+            history: MetricHistory::new(),
         }
     }
 
     fn collect(&mut self) -> Snapshot {
-        Snapshot {
+        let snapshot = Snapshot {
             machine: Machine::collect(),
-            node: Node::collect(&mut self.network),
+            node: self.chain.collect(&mut self.network),
+        };
+        self.history.push(&snapshot);
+        snapshot
+    }
+}
+
+struct MetricHistory {
+    load: Vec<u8>,
+    memory: Vec<u8>,
+    swap: Vec<u8>,
+    sync: Vec<u8>,
+}
+
+impl MetricHistory {
+    fn new() -> Self {
+        Self {
+            load: Vec::with_capacity(HISTORY_SAMPLES),
+            memory: Vec::with_capacity(HISTORY_SAMPLES),
+            swap: Vec::with_capacity(HISTORY_SAMPLES),
+            sync: Vec::with_capacity(HISTORY_SAMPLES),
         }
     }
+
+    fn push(&mut self, snapshot: &Snapshot) {
+        push_sample(&mut self.load, (snapshot.machine.load_one * 25.0) as u8);
+        push_sample(
+            &mut self.memory,
+            percent(
+                snapshot
+                    .machine
+                    .mem_total
+                    .saturating_sub(snapshot.machine.mem_available),
+                snapshot.machine.mem_total,
+            ),
+        );
+        push_sample(
+            &mut self.swap,
+            percent(snapshot.machine.swap_used, snapshot.machine.swap_total),
+        );
+        push_sample(
+            &mut self.sync,
+            if snapshot.node.rpc_ok {
+                (snapshot.node.verification * 100.0) as u8
+            } else {
+                0
+            },
+        );
+    }
+}
+
+fn push_sample(samples: &mut Vec<u8>, value: u8) {
+    if samples.len() == HISTORY_SAMPLES {
+        samples.remove(0);
+    }
+    samples.push(value.min(100));
+}
+
+fn percent(used: u64, total: u64) -> u8 {
+    used.saturating_mul(100)
+        .checked_div(total)
+        .unwrap_or(0)
+        .min(100) as u8
 }
 
 impl Machine {
@@ -355,6 +424,11 @@ impl Machine {
         let load = read_text("/proc/loadavg")
             .map(|s| s.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
             .unwrap_or_else(|| "- - -".to_string());
+        let load_one = load
+            .split_whitespace()
+            .next()
+            .and_then(|value| value.parse::<f32>().ok())
+            .unwrap_or(0.0);
         let meminfo = read_text("/proc/meminfo").unwrap_or_default();
         let mem_total = meminfo_value(&meminfo, "MemTotal");
         let mem_available = meminfo_value(&meminfo, "MemAvailable");
@@ -369,6 +443,7 @@ impl Machine {
         Self {
             uptime_seconds,
             load,
+            load_one,
             mem_available,
             mem_total,
             swap_used: swap_total.saturating_sub(swap_free),
@@ -403,6 +478,34 @@ impl NetworkCache {
             self.connections = json_u64(&network, "connections").unwrap_or(0);
             self.active = json_bool(&network, "networkactive").unwrap_or(false);
         }
+    }
+}
+
+struct ChainCache {
+    snapshot: Option<Node>,
+    next_poll: Instant,
+}
+
+impl ChainCache {
+    fn new() -> Self {
+        Self {
+            snapshot: None,
+            next_poll: Instant::now(),
+        }
+    }
+
+    fn collect(&mut self, network_cache: &mut NetworkCache) -> Node {
+        let now = Instant::now();
+        if now >= self.next_poll {
+            self.next_poll = now + Duration::from_secs(CHAIN_POLL_SECS);
+            self.snapshot = Some(Node::poll(network_cache));
+        }
+        let mut node = self.snapshot.clone().unwrap_or_else(Node::unavailable);
+        node.process_alive = core_process_alive();
+        if !node.process_alive {
+            node.rpc_ok = false;
+        }
+        node
     }
 }
 
@@ -442,7 +545,7 @@ impl Node {
         }
     }
 
-    fn collect(network_cache: &mut NetworkCache) -> Self {
+    fn poll(network_cache: &mut NetworkCache) -> Self {
         let cookie = match read_text("/mnt/bitcoin-node/.cookie") {
             Some(value) => value.trim().to_string(),
             None => return Self::unavailable(),
@@ -648,7 +751,42 @@ fn draw_line(fb: &mut Framebuffer, x: usize, y: usize, text: &str, color: Color,
     fb.text(x, y, text, scale, color);
 }
 
-fn render(fb: &mut Framebuffer, snapshot: &Snapshot) {
+fn draw_history(
+    fb: &mut Framebuffer,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+    samples: &[u8],
+    color: Color,
+) {
+    fb.rect(x, y, width, height, BLACK);
+    fb.rect(x, y + height / 2, width, 1, PANEL_ALT);
+    if samples.is_empty() || width == 0 || height == 0 {
+        return;
+    }
+    let slots = HISTORY_SAMPLES.min(width);
+    let count = samples.len().min(slots);
+    let start = samples.len() - count;
+    let column_width = (width / slots).max(1);
+    let first_slot = slots - count;
+    for (index, value) in samples[start..].iter().enumerate() {
+        let bar_height = height.saturating_sub(2) * (*value as usize) / 100;
+        if bar_height == 0 {
+            continue;
+        }
+        let bar_x = x + (first_slot + index) * column_width;
+        fb.rect(
+            bar_x,
+            y + height - bar_height,
+            column_width.saturating_sub(1).max(1),
+            bar_height,
+            color,
+        );
+    }
+}
+
+fn render(fb: &mut Framebuffer, snapshot: &Snapshot, history: &MetricHistory) {
     let scale = if fb.width >= 600 && fb.height >= 400 {
         2
     } else {
@@ -863,31 +1001,105 @@ fn render(fb: &mut Framebuffer, snapshot: &Snapshot) {
 
     let help_y = body_y + panel_h + panel_gap;
     let help_h = fb.height.saturating_sub(help_y + 16 * scale + margin);
+    let total_w = fb.width.saturating_sub(margin * 2);
+    let history_w = total_w.saturating_mul(3) / 5;
+    let transaction_x = margin + history_w + panel_gap;
+    let transaction_w = total_w.saturating_sub(history_w + panel_gap);
+    draw_panel(fb, margin, help_y, history_w, help_h, "LIVE METRICS", scale);
     draw_panel(
         fb,
-        margin,
+        transaction_x,
         help_y,
-        fb.width.saturating_sub(margin * 2),
+        transaction_w,
         help_h,
-        "SUBMIT A RAW TRANSACTION",
+        "RAW TRANSACTION",
         scale,
     );
-    let mut y = help_y + 17 * scale;
-    let x = margin + 4 * scale;
-    let help_lines = [
-        ("SIGN OFFLINE", CYAN),
-        ("SEND  bitcoin-cli sendrawtransaction HEX", WHITE),
-        ("CHECK bitcoin-cli getmempoolentry TXID", WHITE),
-        ("WALLET DISABLED  KEEP KEYS OFF THIS NODE", AMBER),
-    ];
-    let max_chars = fb.width.saturating_sub(10 * scale) / (6 * scale).max(1);
-    for (text, color) in help_lines {
-        if y + 7 * scale >= fb.height.saturating_sub(12 * scale) {
-            break;
-        }
-        draw_line(fb, x, y, &fit(text, max_chars), color, scale);
-        y += line;
+
+    let chart_x = margin + 4 * scale;
+    let chart_w = history_w.saturating_sub(8 * scale);
+    let chart_h = 12 * scale;
+    let chart_step = 23 * scale;
+    let mut chart_y = help_y + 17 * scale;
+    for (label, samples, color) in [
+        (
+            format!("LOAD1 {}", fit(&snapshot.machine.load, 18)),
+            &history.load,
+            CYAN,
+        ),
+        (
+            format!(
+                "MEM {}%",
+                percent(
+                    snapshot
+                        .machine
+                        .mem_total
+                        .saturating_sub(snapshot.machine.mem_available),
+                    snapshot.machine.mem_total,
+                )
+            ),
+            &history.memory,
+            GREEN,
+        ),
+        (
+            format!(
+                "SWAP {}%",
+                percent(snapshot.machine.swap_used, snapshot.machine.swap_total)
+            ),
+            &history.swap,
+            AMBER,
+        ),
+    ] {
+        draw_line(fb, chart_x, chart_y, &label, color, scale);
+        draw_history(
+            fb,
+            chart_x,
+            chart_y + 9 * scale,
+            chart_w,
+            chart_h,
+            samples,
+            color,
+        );
+        chart_y += chart_step;
     }
+    draw_line(
+        fb,
+        chart_x,
+        chart_y,
+        "3s SAMPLES   30s NODE RPC",
+        MUTED,
+        scale,
+    );
+
+    let guide_x = transaction_x + 4 * scale;
+    let guide_chars = transaction_w.saturating_sub(8 * scale) / (6 * scale).max(1);
+    let mut guide_y = help_y + 17 * scale;
+    for (text, color) in [
+        ("1 SIGN OFFLINE", CYAN),
+        ("2 bitcoin-cli sendrawtransaction HEX", WHITE),
+        ("3 bitcoin-cli getmempoolentry TXID", WHITE),
+        ("KEYS STAY OFF THIS NODE", AMBER),
+    ] {
+        draw_line(fb, guide_x, guide_y, &fit(text, guide_chars), color, scale);
+        guide_y += line;
+    }
+    draw_line(
+        fb,
+        guide_x,
+        help_y + 57 * scale,
+        "SYNC HISTORY",
+        GREEN,
+        scale,
+    );
+    draw_history(
+        fb,
+        guide_x,
+        help_y + 66 * scale,
+        transaction_w.saturating_sub(8 * scale),
+        20 * scale,
+        &history.sync,
+        if snapshot.node.ibd { AMBER } else { GREEN },
+    );
 
     let footer_y = fb.height.saturating_sub(10 * scale);
     fb.rect(
@@ -901,7 +1113,7 @@ fn render(fb: &mut Framebuffer, snapshot: &Snapshot) {
         fb,
         margin,
         footer_y,
-        "DIRECT FBDEV  30s POLL  SIGTERM TO EXIT",
+        "DIRECT FBDEV  3s DRAW  30s RPC  SIGTERM TO EXIT",
         MUTED,
         scale,
     );
@@ -998,11 +1210,11 @@ fn main() {
     loop {
         let started = Instant::now();
         let snapshot = dashboard.collect();
-        render(&mut framebuffer, &snapshot);
+        render(&mut framebuffer, &snapshot, &dashboard.history);
         framebuffer.publish();
         let elapsed = started.elapsed();
-        if elapsed < Duration::from_secs(30) {
-            thread::sleep(Duration::from_secs(30) - elapsed);
+        if elapsed < Duration::from_secs(DASHBOARD_TICK_SECS) {
+            thread::sleep(Duration::from_secs(DASHBOARD_TICK_SECS) - elapsed);
         }
     }
 }
@@ -1036,5 +1248,18 @@ mod tests {
     fn logical_landscape_maps_to_the_visible_physical_strip() {
         assert_eq!(physical_position(0, 0), (1279, 0));
         assert_eq!(physical_position(1279, 479), (0, 479));
+    }
+
+    #[test]
+    fn metric_history_is_bounded_and_percent_is_safe() {
+        let mut samples = Vec::new();
+        for value in 0..100 {
+            push_sample(&mut samples, value);
+        }
+        assert_eq!(samples.len(), HISTORY_SAMPLES);
+        assert_eq!(samples[0], 20);
+        assert_eq!(samples[HISTORY_SAMPLES - 1], 99);
+        assert_eq!(percent(1, 0), 0);
+        assert_eq!(percent(3, 4), 75);
     }
 }
