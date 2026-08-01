@@ -13,6 +13,16 @@ const PROT_READ: c_int = 0x1;
 const PROT_WRITE: c_int = 0x2;
 const MAP_SHARED: c_int = 0x01;
 const MAP_FAILED: *mut c_void = -1isize as *mut c_void;
+const LOGICAL_WIDTH: usize = 1280;
+const LOGICAL_HEIGHT: usize = 480;
+const PHYSICAL_WIDTH: usize = 600;
+const PHYSICAL_HEIGHT: usize = 1280;
+
+#[inline]
+fn physical_position(logical_x: usize, logical_y: usize) -> (usize, usize) {
+    debug_assert!(logical_x < LOGICAL_WIDTH && logical_y < LOGICAL_HEIGHT);
+    (PHYSICAL_HEIGHT - 1 - logical_x, logical_y)
+}
 
 const BLACK: Color = Color::new(5, 8, 14);
 const PANEL: Color = Color::new(12, 18, 29);
@@ -120,12 +130,13 @@ struct Framebuffer {
     width: usize,
     height: usize,
     line_length: usize,
-    bytes_per_pixel: usize,
     bits_per_pixel: u32,
     red: FbBitfield,
     green: FbBitfield,
     blue: FbBitfield,
     transp: FbBitfield,
+    canvas: Vec<u16>,
+    row: Vec<u16>,
 }
 
 impl Framebuffer {
@@ -143,16 +154,25 @@ impl Framebuffer {
         if var_result < 0 || fix_result < 0 {
             return Err("framebuffer ioctl failed".to_string());
         }
-        if var.xres == 0 || var.yres == 0 || fix.smem_len == 0 {
-            return Err("framebuffer has no drawable geometry".to_string());
-        }
-        if var.bits_per_pixel != 16 && var.bits_per_pixel != 24 && var.bits_per_pixel != 32 {
-            return Err(format!(
-                "unsupported framebuffer depth: {}",
-                var.bits_per_pixel
-            ));
-        }
+        let stride = fix.line_length as usize;
         let len = fix.smem_len as usize;
+        let required = stride.saturating_mul(PHYSICAL_HEIGHT);
+        if var.xres as usize != PHYSICAL_WIDTH
+            || var.yres as usize != PHYSICAL_HEIGHT
+            || var.bits_per_pixel != 16
+            || stride < PHYSICAL_WIDTH * 2
+            || !stride.is_multiple_of(2)
+            || len < required
+            || var.red.offset != 11
+            || var.red.length != 5
+            || var.green.offset != 5
+            || var.green.length != 6
+            || var.blue.offset != 0
+            || var.blue.length != 5
+            || var.transp.length != 0
+        {
+            return Err("unsupported framebuffer; expected rotated 600x1280 RGB565".to_string());
+        }
         let ptr = unsafe {
             mmap(
                 std::ptr::null_mut(),
@@ -170,15 +190,16 @@ impl Framebuffer {
             _file: file,
             ptr: ptr.cast(),
             len,
-            width: var.xres as usize,
-            height: var.yres as usize,
-            line_length: fix.line_length as usize,
-            bytes_per_pixel: (var.bits_per_pixel / 8) as usize,
+            width: LOGICAL_WIDTH,
+            height: LOGICAL_HEIGHT,
+            line_length: stride,
             bits_per_pixel: var.bits_per_pixel,
             red: var.red,
             green: var.green,
             blue: var.blue,
             transp: var.transp,
+            canvas: vec![0; LOGICAL_WIDTH * LOGICAL_HEIGHT],
+            row: vec![0; LOGICAL_HEIGHT],
         })
     }
 
@@ -195,45 +216,22 @@ impl Framebuffer {
         scaled << field.offset
     }
 
-    fn pixel_value(&self, color: Color) -> u32 {
-        Self::pack_channel(color.r, self.red)
+    fn pixel_value(&self, color: Color) -> u16 {
+        (Self::pack_channel(color.r, self.red)
             | Self::pack_channel(color.g, self.green)
             | Self::pack_channel(color.b, self.blue)
-            | Self::pack_channel(255, self.transp)
+            | Self::pack_channel(255, self.transp)) as u16
     }
 
     fn pixel(&mut self, x: usize, y: usize, color: Color) {
-        if x >= self.width || y >= self.height {
-            return;
-        }
-        let offset = y
-            .saturating_mul(self.line_length)
-            .saturating_add(x.saturating_mul(self.bytes_per_pixel));
-        if offset.saturating_add(self.bytes_per_pixel) > self.len {
-            return;
-        }
-        let value = self.pixel_value(color);
-        unsafe {
-            let p = self.ptr.add(offset);
-            match self.bits_per_pixel {
-                16 => (p as *mut u16).write_unaligned(value as u16),
-                24 => {
-                    p.write(value as u8);
-                    p.add(1).write((value >> 8) as u8);
-                    p.add(2).write((value >> 16) as u8);
-                }
-                32 => (p as *mut u32).write_unaligned(value),
-                _ => {}
-            }
+        if x < self.width && y < self.height {
+            self.canvas[y * self.width + x] = self.pixel_value(color);
         }
     }
 
     fn fill(&mut self, color: Color) {
-        for y in 0..self.height {
-            for x in 0..self.width {
-                self.pixel(x, y, color);
-            }
-        }
+        let value = self.pixel_value(color);
+        self.canvas.fill(value);
     }
 
     fn rect(&mut self, x: usize, y: usize, width: usize, height: usize, color: Color) {
@@ -271,6 +269,20 @@ impl Framebuffer {
                     scale,
                     color,
                 );
+            }
+        }
+    }
+
+    fn publish(&mut self) {
+        for logical_x in 0..LOGICAL_WIDTH {
+            let (physical_row, _) = physical_position(logical_x, 0);
+            let destination =
+                unsafe { self.ptr.add(physical_row * self.line_length).cast::<u16>() };
+            for logical_y in 0..LOGICAL_HEIGHT {
+                self.row[logical_y] = self.canvas[logical_y * LOGICAL_WIDTH + logical_x];
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.row.as_ptr(), destination, LOGICAL_HEIGHT);
             }
         }
     }
@@ -987,6 +999,7 @@ fn main() {
         let started = Instant::now();
         let snapshot = dashboard.collect();
         render(&mut framebuffer, &snapshot);
+        framebuffer.publish();
         let elapsed = started.elapsed();
         if elapsed < Duration::from_secs(30) {
             thread::sleep(Duration::from_secs(30) - elapsed);
@@ -1017,5 +1030,11 @@ mod tests {
         assert_eq!(format_uptime(90_061), "1d 01h 01m");
         assert_eq!(format_size(864_053_269_491), "864G");
         assert_eq!(fit("ABCDEFGHIJKLMNOPQRSTUVWXYZ", 8), "ABCDEFGH");
+    }
+
+    #[test]
+    fn logical_landscape_maps_to_the_visible_physical_strip() {
+        assert_eq!(physical_position(0, 0), (1279, 0));
+        assert_eq!(physical_position(1279, 479), (0, 479));
     }
 }

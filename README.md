@@ -4,8 +4,8 @@ A small Rust framebuffer dashboard for the Braiins Deck node mode.
 
 It intentionally avoids GTK, SDL, Wayland, a JSON crate, a service framework,
 and a graphics dependency. The release binary opens `/dev/fb0`, maps the
-existing framebuffer, draws a small fixed 5x7 font, and polls Bitcoin Core's
-loopback RPC every two seconds.
+existing framebuffer, draws a fixed 5x7 font at a readable 2x scale, and polls
+Bitcoin Core's loopback RPC every 30 seconds.
 
 The screen shows:
 
@@ -18,12 +18,28 @@ The screen shows:
 The node is expected to use cookie authentication at
 `/mnt/bitcoin-node/.cookie` and RPC at `127.0.0.1:8332`.
 
+## Deck framebuffer
+
+The Deck exposes a `600x1280` physical RGB565 framebuffer, while the panel is
+used as a `1280x480` landscape display. The dashboard renders into that logical
+landscape canvas, then rotates each logical column into a physical scanout row:
+
+```text
+physical row    = 1279 - logical x
+physical column = logical y
+```
+
+The scanout needs only a 1.2 MiB logical RGB565 canvas and a reusable 960-byte
+row staging buffer. The staged bulk copy avoids corrupt partial framebuffer
+writes and keeps the display readable without a terminal emulator or graphics
+stack.
+
 ## Build
 
 Host tests and a release build need only Rust:
 
 ```sh
-cargo test --release
+cargo test --locked --release
 cargo build --release
 ```
 
@@ -52,9 +68,9 @@ SIGTERM or SIGINT. Do not unmount the SSD while Bitcoin Core is running.
 
 ## Design constraints
 
-- Direct fbdev only. No compositor and no framebuffer-sized backbuffer.
+- Direct fbdev only. No compositor or terminal emulator.
 - No dependencies outside the Rust standard library and Linux C ABI calls for
   `ioctl`, `mmap`, and `munmap`.
-- Fixed small font and bounded RPC response reads.
+- Fixed readable font, one logical canvas, and bounded RPC response reads.
 - RPC timeouts are short so a slow or starting node cannot stall the display.
 - The dashboard never prints or renders the RPC cookie.
