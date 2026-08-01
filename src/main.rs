@@ -1,0 +1,1021 @@
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::net::{Shutdown, TcpStream};
+use std::os::fd::AsRawFd;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use std::os::raw::{c_int, c_long, c_ulong, c_void};
+
+const FBIOGET_VSCREENINFO: c_ulong = 0x4600;
+const FBIOGET_FSCREENINFO: c_ulong = 0x4602;
+const PROT_READ: c_int = 0x1;
+const PROT_WRITE: c_int = 0x2;
+const MAP_SHARED: c_int = 0x01;
+const MAP_FAILED: *mut c_void = -1isize as *mut c_void;
+
+const BLACK: Color = Color::new(5, 8, 14);
+const PANEL: Color = Color::new(12, 18, 29);
+const PANEL_ALT: Color = Color::new(16, 24, 38);
+const WHITE: Color = Color::new(226, 235, 244);
+const MUTED: Color = Color::new(137, 157, 177);
+const CYAN: Color = Color::new(65, 202, 220);
+const GREEN: Color = Color::new(76, 211, 141);
+const AMBER: Color = Color::new(242, 183, 76);
+const RED: Color = Color::new(238, 92, 92);
+const BLUE: Color = Color::new(84, 145, 235);
+
+unsafe extern "C" {
+    fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
+    fn mmap(
+        addr: *mut c_void,
+        length: usize,
+        prot: c_int,
+        flags: c_int,
+        fd: c_int,
+        offset: c_long,
+    ) -> *mut c_void;
+    fn munmap(addr: *mut c_void, length: usize) -> c_int;
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FbBitfield {
+    offset: u32,
+    length: u32,
+    msb_right: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FbVarScreeninfo {
+    xres: u32,
+    yres: u32,
+    xres_virtual: u32,
+    yres_virtual: u32,
+    xoffset: u32,
+    yoffset: u32,
+    bits_per_pixel: u32,
+    grayscale: u32,
+    red: FbBitfield,
+    green: FbBitfield,
+    blue: FbBitfield,
+    transp: FbBitfield,
+    nonstd: u32,
+    activate: u32,
+    height: u32,
+    width: u32,
+    accel_flags: u32,
+    pixclock: u32,
+    left_margin: u32,
+    right_margin: u32,
+    upper_margin: u32,
+    lower_margin: u32,
+    hsync_len: u32,
+    vsync_len: u32,
+    sync: u32,
+    vmode: u32,
+    rotate: u32,
+    colorspace: u32,
+    reserved: [u32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FbFixScreeninfo {
+    id: [u8; 16],
+    smem_start: usize,
+    smem_len: u32,
+    type_: u32,
+    type_aux: u32,
+    visual: u32,
+    xpanstep: u16,
+    ypanstep: u16,
+    ywrapstep: u16,
+    line_length: u32,
+    mmio_start: usize,
+    mmio_len: u32,
+    accel: u32,
+    capabilities: u16,
+    reserved: [u16; 2],
+}
+
+#[derive(Clone, Copy)]
+struct Color {
+    r: u8,
+    g: u8,
+    b: u8,
+}
+
+impl Color {
+    const fn new(r: u8, g: u8, b: u8) -> Self {
+        Self { r, g, b }
+    }
+}
+
+struct Framebuffer {
+    _file: File,
+    ptr: *mut u8,
+    len: usize,
+    width: usize,
+    height: usize,
+    line_length: usize,
+    bytes_per_pixel: usize,
+    bits_per_pixel: u32,
+    red: FbBitfield,
+    green: FbBitfield,
+    blue: FbBitfield,
+    transp: FbBitfield,
+}
+
+impl Framebuffer {
+    fn open(path: &str) -> Result<Self, String> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|e| format!("open {path}: {e}"))?;
+        let fd = file.as_raw_fd();
+        let mut var = FbVarScreeninfo::default();
+        let mut fix = FbFixScreeninfo::default();
+        let var_result = unsafe { ioctl(fd, FBIOGET_VSCREENINFO, &mut var) };
+        let fix_result = unsafe { ioctl(fd, FBIOGET_FSCREENINFO, &mut fix) };
+        if var_result < 0 || fix_result < 0 {
+            return Err("framebuffer ioctl failed".to_string());
+        }
+        if var.xres == 0 || var.yres == 0 || fix.smem_len == 0 {
+            return Err("framebuffer has no drawable geometry".to_string());
+        }
+        if var.bits_per_pixel != 16 && var.bits_per_pixel != 24 && var.bits_per_pixel != 32 {
+            return Err(format!(
+                "unsupported framebuffer depth: {}",
+                var.bits_per_pixel
+            ));
+        }
+        let len = fix.smem_len as usize;
+        let ptr = unsafe {
+            mmap(
+                std::ptr::null_mut(),
+                len,
+                PROT_READ | PROT_WRITE,
+                MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        if ptr == MAP_FAILED {
+            return Err("framebuffer mmap failed".to_string());
+        }
+        Ok(Self {
+            _file: file,
+            ptr: ptr.cast(),
+            len,
+            width: var.xres as usize,
+            height: var.yres as usize,
+            line_length: fix.line_length as usize,
+            bytes_per_pixel: (var.bits_per_pixel / 8) as usize,
+            bits_per_pixel: var.bits_per_pixel,
+            red: var.red,
+            green: var.green,
+            blue: var.blue,
+            transp: var.transp,
+        })
+    }
+
+    fn pack_channel(value: u8, field: FbBitfield) -> u32 {
+        if field.length == 0 {
+            return 0;
+        }
+        let max = if field.length >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << field.length) - 1
+        };
+        let scaled = ((value as u64 * max as u64 + 127) / 255) as u32;
+        scaled << field.offset
+    }
+
+    fn pixel_value(&self, color: Color) -> u32 {
+        Self::pack_channel(color.r, self.red)
+            | Self::pack_channel(color.g, self.green)
+            | Self::pack_channel(color.b, self.blue)
+            | Self::pack_channel(255, self.transp)
+    }
+
+    fn pixel(&mut self, x: usize, y: usize, color: Color) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        let offset = y
+            .saturating_mul(self.line_length)
+            .saturating_add(x.saturating_mul(self.bytes_per_pixel));
+        if offset.saturating_add(self.bytes_per_pixel) > self.len {
+            return;
+        }
+        let value = self.pixel_value(color);
+        unsafe {
+            let p = self.ptr.add(offset);
+            match self.bits_per_pixel {
+                16 => (p as *mut u16).write_unaligned(value as u16),
+                24 => {
+                    p.write(value as u8);
+                    p.add(1).write((value >> 8) as u8);
+                    p.add(2).write((value >> 16) as u8);
+                }
+                32 => (p as *mut u32).write_unaligned(value),
+                _ => {}
+            }
+        }
+    }
+
+    fn fill(&mut self, color: Color) {
+        for y in 0..self.height {
+            for x in 0..self.width {
+                self.pixel(x, y, color);
+            }
+        }
+    }
+
+    fn rect(&mut self, x: usize, y: usize, width: usize, height: usize, color: Color) {
+        let x_end = x.saturating_add(width).min(self.width);
+        let y_end = y.saturating_add(height).min(self.height);
+        for yy in y.min(self.height)..y_end {
+            for xx in x.min(self.width)..x_end {
+                self.pixel(xx, yy, color);
+            }
+        }
+    }
+
+    fn text(&mut self, x: usize, y: usize, text: &str, scale: usize, color: Color) {
+        let mut cursor = x;
+        for byte in text.bytes() {
+            self.glyph(cursor, y, byte, scale, color);
+            cursor = cursor.saturating_add(6usize.saturating_mul(scale));
+            if cursor >= self.width {
+                break;
+            }
+        }
+    }
+
+    fn glyph(&mut self, x: usize, y: usize, byte: u8, scale: usize, color: Color) {
+        let glyph = glyph(byte);
+        for (column, bits) in glyph.iter().enumerate() {
+            for row in 0..7usize {
+                if bits & (1 << row) == 0 {
+                    continue;
+                }
+                self.rect(
+                    x.saturating_add(column.saturating_mul(scale)),
+                    y.saturating_add(row.saturating_mul(scale)),
+                    scale,
+                    scale,
+                    color,
+                );
+            }
+        }
+    }
+}
+
+impl Drop for Framebuffer {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = munmap(self.ptr.cast(), self.len);
+        }
+    }
+}
+
+struct Machine {
+    uptime_seconds: u64,
+    load: String,
+    mem_available: u64,
+    mem_total: u64,
+    swap_used: u64,
+    swap_total: u64,
+    disk_mounted: bool,
+}
+
+struct Node {
+    rpc_ok: bool,
+    process_alive: bool,
+    blocks: u64,
+    headers: u64,
+    verification: f64,
+    ibd: bool,
+    pruned: bool,
+    connections: u64,
+    network_active: bool,
+    disk_bytes: u64,
+}
+
+struct Snapshot {
+    machine: Machine,
+    node: Node,
+}
+
+struct Dashboard {
+    network: NetworkCache,
+}
+
+impl Dashboard {
+    fn new() -> Self {
+        Self {
+            network: NetworkCache::new(),
+        }
+    }
+
+    fn collect(&mut self) -> Snapshot {
+        Snapshot {
+            machine: Machine::collect(),
+            node: Node::collect(&mut self.network),
+        }
+    }
+}
+
+impl Machine {
+    fn collect() -> Self {
+        let uptime_seconds = read_text("/proc/uptime")
+            .and_then(|s| {
+                s.split_whitespace()
+                    .next()
+                    .map(|v| v.parse::<f64>().unwrap_or(0.0) as u64)
+            })
+            .unwrap_or(0);
+        let load = read_text("/proc/loadavg")
+            .map(|s| s.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
+            .unwrap_or_else(|| "- - -".to_string());
+        let meminfo = read_text("/proc/meminfo").unwrap_or_default();
+        let mem_total = meminfo_value(&meminfo, "MemTotal");
+        let mem_available = meminfo_value(&meminfo, "MemAvailable");
+        let swap_total = meminfo_value(&meminfo, "SwapTotal");
+        let swap_free = meminfo_value(&meminfo, "SwapFree");
+        let disk_mounted = read_text("/proc/mounts")
+            .map(|s| {
+                s.lines()
+                    .any(|line| line.split_whitespace().nth(1) == Some("/mnt/bitcoin-node"))
+            })
+            .unwrap_or(false);
+        Self {
+            uptime_seconds,
+            load,
+            mem_available,
+            mem_total,
+            swap_used: swap_total.saturating_sub(swap_free),
+            swap_total,
+            disk_mounted,
+        }
+    }
+}
+
+struct NetworkCache {
+    connections: u64,
+    active: bool,
+    next_poll: Instant,
+}
+
+impl NetworkCache {
+    fn new() -> Self {
+        Self {
+            connections: 0,
+            active: false,
+            next_poll: Instant::now(),
+        }
+    }
+
+    fn refresh(&mut self, rpc: &Rpc) {
+        let now = Instant::now();
+        if now < self.next_poll {
+            return;
+        }
+        self.next_poll = now + Duration::from_secs(120);
+        if let Ok(network) = rpc.call("getnetworkinfo") {
+            self.connections = json_u64(&network, "connections").unwrap_or(0);
+            self.active = json_bool(&network, "networkactive").unwrap_or(false);
+        }
+    }
+}
+
+fn core_process_alive() -> bool {
+    let entries = match std::fs::read_dir("/proc") {
+        Ok(entries) => entries,
+        Err(_) => return false,
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.bytes().all(|byte| byte.is_ascii_digit()) {
+            return false;
+        }
+        let path = entry.path().join("cmdline");
+        let command = match std::fs::read_to_string(path) {
+            Ok(command) => command,
+            Err(_) => return false,
+        };
+        command.contains("/bitcoind")
+    })
+}
+
+impl Node {
+    fn unavailable() -> Self {
+        Self {
+            rpc_ok: false,
+            process_alive: core_process_alive(),
+            blocks: 0,
+            headers: 0,
+            verification: 0.0,
+            ibd: true,
+            pruned: false,
+            connections: 0,
+            network_active: false,
+            disk_bytes: 0,
+        }
+    }
+
+    fn collect(network_cache: &mut NetworkCache) -> Self {
+        let cookie = match read_text("/mnt/bitcoin-node/.cookie") {
+            Some(value) => value.trim().to_string(),
+            None => return Self::unavailable(),
+        };
+        let rpc = Rpc::new(cookie);
+        let chain = match rpc.call("getblockchaininfo") {
+            Ok(body) => body,
+            Err(_) => return Self::unavailable(),
+        };
+        network_cache.refresh(&rpc);
+        Self {
+            rpc_ok: true,
+            process_alive: true,
+            blocks: json_u64(&chain, "blocks").unwrap_or(0),
+            headers: json_u64(&chain, "headers").unwrap_or(0),
+            verification: json_f64(&chain, "verificationprogress").unwrap_or(0.0),
+            ibd: json_bool(&chain, "initialblockdownload").unwrap_or(true),
+            pruned: json_bool(&chain, "pruned").unwrap_or(false),
+            connections: network_cache.connections,
+            network_active: network_cache.active,
+            disk_bytes: json_u64(&chain, "size_on_disk").unwrap_or(0),
+        }
+    }
+}
+
+struct Rpc {
+    cookie: String,
+}
+
+impl Rpc {
+    fn new(cookie: String) -> Self {
+        Self { cookie }
+    }
+
+    fn call(&self, method: &str) -> Result<String, String> {
+        let mut stream = TcpStream::connect_timeout(
+            &"127.0.0.1:8332"
+                .parse::<std::net::SocketAddr>()
+                .map_err(|e| e.to_string())?,
+            Duration::from_millis(350),
+        )
+        .map_err(|e| e.to_string())?;
+        stream
+            .set_read_timeout(Some(Duration::from_millis(700)))
+            .map_err(|e| e.to_string())?;
+        stream
+            .set_write_timeout(Some(Duration::from_millis(350)))
+            .map_err(|e| e.to_string())?;
+        let auth = base64(self.cookie.as_bytes());
+        let body = format!(
+            "{{\"jsonrpc\":\"1.0\",\"id\":\"dash\",\"method\":\"{method}\",\"params\":[]}}"
+        );
+        let request = format!(
+            "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Basic {auth}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream
+            .write_all(request.as_bytes())
+            .map_err(|e| e.to_string())?;
+        let _ = stream.shutdown(Shutdown::Write);
+        let mut response = Vec::with_capacity(4096);
+        stream
+            .take(64 * 1024)
+            .read_to_end(&mut response)
+            .map_err(|e| e.to_string())?;
+        let response = String::from_utf8_lossy(&response);
+        let body = response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .ok_or_else(|| "bad HTTP response".to_string())?;
+        if body.contains("\"error\":null") || body.contains("\"result\":") {
+            Ok(body.to_string())
+        } else {
+            Err("RPC error".to_string())
+        }
+    }
+}
+
+fn read_text(path: &str) -> Option<String> {
+    std::fs::read_to_string(path).ok()
+}
+
+fn meminfo_value(text: &str, key: &str) -> u64 {
+    text.lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name != key {
+                return None;
+            }
+            value.split_whitespace().next()?.parse::<u64>().ok()
+        })
+        .unwrap_or(0)
+        / 1024
+}
+
+fn json_number_start<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+    let needle = format!("\"{key}\"");
+    let after = body.split_once(&needle)?.1;
+    let after = after.split_once(':')?.1.trim_start();
+    Some(after)
+}
+
+fn json_u64(body: &str, key: &str) -> Option<u64> {
+    let value = json_number_start(body, key)?;
+    let end = value
+        .bytes()
+        .position(|b| !b.is_ascii_digit())
+        .unwrap_or(value.len());
+    value[..end].parse().ok()
+}
+
+fn json_f64(body: &str, key: &str) -> Option<f64> {
+    let value = json_number_start(body, key)?;
+    let end = value
+        .bytes()
+        .position(|b| {
+            !(b.is_ascii_digit() || b == b'.' || b == b'-' || b == b'e' || b == b'E' || b == b'+')
+        })
+        .unwrap_or(value.len());
+    value[..end].parse().ok()
+}
+
+fn json_bool(body: &str, key: &str) -> Option<bool> {
+    let value = json_number_start(body, key)?;
+    if value.starts_with("true") {
+        Some(true)
+    } else if value.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn base64(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
+    let mut index = 0;
+    while index < input.len() {
+        let a = input[index] as u32;
+        let b = input.get(index + 1).copied().unwrap_or(0) as u32;
+        let c = input.get(index + 2).copied().unwrap_or(0) as u32;
+        let triple = (a << 16) | (b << 8) | c;
+        output.push(TABLE[((triple >> 18) & 63) as usize] as char);
+        output.push(TABLE[((triple >> 12) & 63) as usize] as char);
+        output.push(if index + 1 < input.len() {
+            TABLE[((triple >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        output.push(if index + 2 < input.len() {
+            TABLE[(triple & 63) as usize] as char
+        } else {
+            '='
+        });
+        index += 3;
+    }
+    output
+}
+
+fn format_uptime(seconds: u64) -> String {
+    let days = seconds / 86_400;
+    let hours = (seconds / 3_600) % 24;
+    let minutes = (seconds / 60) % 60;
+    if days > 0 {
+        format!("{days}d {hours:02}h {minutes:02}m")
+    } else {
+        format!("{hours:02}h {minutes:02}m")
+    }
+}
+
+fn format_size(bytes: u64) -> String {
+    if bytes >= 1_000_000_000_000 {
+        format!("{}T", bytes / 1_000_000_000_000)
+    } else if bytes >= 1_000_000_000 {
+        format!("{}G", bytes / 1_000_000_000)
+    } else if bytes >= 1_000_000 {
+        format!("{}M", bytes / 1_000_000)
+    } else {
+        format!("{}K", bytes / 1_000)
+    }
+}
+
+fn fit(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
+}
+
+fn draw_panel(
+    fb: &mut Framebuffer,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    title: &str,
+    scale: usize,
+) {
+    fb.rect(x, y, w, h, PANEL);
+    fb.rect(x, y, w, scale.max(1), CYAN);
+    fb.text(x + 4 * scale, y + 4 * scale, title, scale, WHITE);
+}
+
+fn draw_line(fb: &mut Framebuffer, x: usize, y: usize, text: &str, color: Color, scale: usize) {
+    fb.text(x, y, text, scale, color);
+}
+
+fn render(fb: &mut Framebuffer, snapshot: &Snapshot) {
+    let scale = if fb.width >= 600 && fb.height >= 400 {
+        2
+    } else {
+        1
+    };
+    let margin = 5 * scale;
+    let line = 9 * scale;
+    fb.fill(BLACK);
+
+    let header_h = 18 * scale;
+    fb.rect(0, 0, fb.width, header_h, PANEL_ALT);
+    fb.text(margin, 5 * scale, "BITCOIN NODE", scale, WHITE);
+    let status = if snapshot.node.rpc_ok {
+        "ONLINE"
+    } else if snapshot.node.process_alive {
+        "RUNNING"
+    } else {
+        "STARTING"
+    };
+    let status_color = if snapshot.node.rpc_ok {
+        GREEN
+    } else if snapshot.node.process_alive {
+        AMBER
+    } else {
+        RED
+    };
+    let status_x = fb.width.saturating_sub((status.len() * 6 + 7) * scale);
+    fb.rect(
+        status_x.saturating_sub(3 * scale),
+        4 * scale,
+        4 * scale,
+        9 * scale,
+        status_color,
+    );
+    fb.text(status_x + 4 * scale, 5 * scale, status, scale, status_color);
+
+    let body_y = header_h + margin;
+    let panel_gap = margin;
+    let panel_h = 74 * scale;
+    let panel_w = (fb.width.saturating_sub(margin * 2 + panel_gap)) / 2;
+    let left_x = margin;
+    let right_x = left_x + panel_w + panel_gap;
+    draw_panel(fb, left_x, body_y, panel_w, panel_h, "MACHINE", scale);
+    draw_panel(fb, right_x, body_y, panel_w, panel_h, "NODE", scale);
+
+    let machine_color = if !snapshot.machine.disk_mounted {
+        RED
+    } else if snapshot.machine.mem_available < 16 {
+        AMBER
+    } else {
+        GREEN
+    };
+    let node_color = if !snapshot.node.rpc_ok {
+        if snapshot.node.process_alive {
+            AMBER
+        } else {
+            RED
+        }
+    } else if snapshot.node.ibd || snapshot.node.headers > snapshot.node.blocks {
+        AMBER
+    } else {
+        GREEN
+    };
+    let text_x = left_x + 4 * scale;
+    let mut y = body_y + 17 * scale;
+    draw_line(
+        fb,
+        text_x,
+        y,
+        &format!("UP {}", format_uptime(snapshot.machine.uptime_seconds)),
+        WHITE,
+        scale,
+    );
+    y += line;
+    draw_line(
+        fb,
+        text_x,
+        y,
+        &format!("LOAD {}", fit(&snapshot.machine.load, 18)),
+        MUTED,
+        scale,
+    );
+    y += line;
+    draw_line(
+        fb,
+        text_x,
+        y,
+        &format!(
+            "RAM {} / {}M",
+            snapshot.machine.mem_available, snapshot.machine.mem_total
+        ),
+        machine_color,
+        scale,
+    );
+    y += line;
+    draw_line(
+        fb,
+        text_x,
+        y,
+        &format!(
+            "SWAP {} / {}M",
+            snapshot.machine.swap_used, snapshot.machine.swap_total
+        ),
+        if snapshot.machine.swap_used > 384 {
+            AMBER
+        } else {
+            MUTED
+        },
+        scale,
+    );
+    y += line;
+    draw_line(
+        fb,
+        text_x,
+        y,
+        if snapshot.machine.disk_mounted {
+            "SSD MOUNTED"
+        } else {
+            "SSD MISSING"
+        },
+        machine_color,
+        scale,
+    );
+    y += line;
+    draw_line(
+        fb,
+        text_x,
+        y,
+        &format!("FB {}x{} {}b", fb.width, fb.height, fb.bits_per_pixel),
+        MUTED,
+        scale,
+    );
+
+    let text_x = right_x + 4 * scale;
+    let mut y = body_y + 17 * scale;
+    draw_line(fb, text_x, y, "CORE v31.0.0", WHITE, scale);
+    y += line;
+    draw_line(
+        fb,
+        text_x,
+        y,
+        if snapshot.node.rpc_ok {
+            "RPC READY"
+        } else {
+            "RPC WAITING"
+        },
+        node_color,
+        scale,
+    );
+    y += line;
+    draw_line(
+        fb,
+        text_x,
+        y,
+        if snapshot.node.rpc_ok {
+            format!("CHAIN {} / {}", snapshot.node.blocks, snapshot.node.headers)
+        } else {
+            "CHAIN WAITING".to_string()
+        }
+        .as_str(),
+        node_color,
+        scale,
+    );
+    y += line;
+    draw_line(
+        fb,
+        text_x,
+        y,
+        if snapshot.node.rpc_ok {
+            format!("SYNC {:>5.2}%", snapshot.node.verification * 100.0)
+        } else {
+            "SYNC WAITING".to_string()
+        }
+        .as_str(),
+        if snapshot.node.ibd { AMBER } else { GREEN },
+        scale,
+    );
+    y += line;
+    draw_line(
+        fb,
+        text_x,
+        y,
+        &format!(
+            "PEERS {} {}",
+            snapshot.node.connections,
+            if snapshot.node.network_active {
+                "NET"
+            } else {
+                "OFF"
+            }
+        ),
+        MUTED,
+        scale,
+    );
+    y += line;
+    draw_line(
+        fb,
+        text_x,
+        y,
+        &format!(
+            "{} {}",
+            if snapshot.node.pruned {
+                "PRUNED"
+            } else {
+                "ARCHIVAL"
+            },
+            format_size(snapshot.node.disk_bytes),
+        ),
+        if snapshot.node.pruned { RED } else { GREEN },
+        scale,
+    );
+
+    let help_y = body_y + panel_h + panel_gap;
+    let help_h = fb.height.saturating_sub(help_y + 16 * scale + margin);
+    draw_panel(
+        fb,
+        margin,
+        help_y,
+        fb.width.saturating_sub(margin * 2),
+        help_h,
+        "SUBMIT A RAW TRANSACTION",
+        scale,
+    );
+    let mut y = help_y + 17 * scale;
+    let x = margin + 4 * scale;
+    let help_lines = [
+        ("SIGN OFFLINE", CYAN),
+        ("SEND  bitcoin-cli sendrawtransaction HEX", WHITE),
+        ("CHECK bitcoin-cli getmempoolentry TXID", WHITE),
+        ("WALLET DISABLED  KEEP KEYS OFF THIS NODE", AMBER),
+    ];
+    let max_chars = fb.width.saturating_sub(10 * scale) / (6 * scale).max(1);
+    for (text, color) in help_lines {
+        if y + 7 * scale >= fb.height.saturating_sub(12 * scale) {
+            break;
+        }
+        draw_line(fb, x, y, &fit(text, max_chars), color, scale);
+        y += line;
+    }
+
+    let footer_y = fb.height.saturating_sub(10 * scale);
+    fb.rect(
+        0,
+        footer_y.saturating_sub(2 * scale),
+        fb.width,
+        2 * scale,
+        BLUE,
+    );
+    draw_line(
+        fb,
+        margin,
+        footer_y,
+        "DIRECT FBDEV  30s POLL  SIGTERM TO EXIT",
+        MUTED,
+        scale,
+    );
+}
+
+fn glyph(byte: u8) -> [u8; 5] {
+    match byte.to_ascii_uppercase() {
+        b'A' => [0x7e, 0x11, 0x11, 0x11, 0x7e],
+        b'B' => [0x7f, 0x49, 0x49, 0x49, 0x36],
+        b'C' => [0x3e, 0x41, 0x41, 0x41, 0x22],
+        b'D' => [0x7f, 0x41, 0x41, 0x22, 0x1c],
+        b'E' => [0x7f, 0x49, 0x49, 0x49, 0x41],
+        b'F' => [0x7f, 0x09, 0x09, 0x09, 0x01],
+        b'G' => [0x3e, 0x41, 0x49, 0x49, 0x7a],
+        b'H' => [0x7f, 0x08, 0x08, 0x08, 0x7f],
+        b'I' => [0x00, 0x41, 0x7f, 0x41, 0x00],
+        b'J' => [0x20, 0x40, 0x41, 0x3f, 0x01],
+        b'K' => [0x7f, 0x08, 0x14, 0x22, 0x41],
+        b'L' => [0x7f, 0x40, 0x40, 0x40, 0x40],
+        b'M' => [0x7f, 0x02, 0x0c, 0x02, 0x7f],
+        b'N' => [0x7f, 0x04, 0x08, 0x10, 0x7f],
+        b'O' => [0x3e, 0x41, 0x41, 0x41, 0x3e],
+        b'P' => [0x7f, 0x09, 0x09, 0x09, 0x06],
+        b'Q' => [0x3e, 0x41, 0x51, 0x21, 0x5e],
+        b'R' => [0x7f, 0x09, 0x19, 0x29, 0x46],
+        b'S' => [0x46, 0x49, 0x49, 0x49, 0x31],
+        b'T' => [0x01, 0x01, 0x7f, 0x01, 0x01],
+        b'U' => [0x3f, 0x40, 0x40, 0x40, 0x3f],
+        b'V' => [0x1f, 0x20, 0x40, 0x20, 0x1f],
+        b'W' => [0x3f, 0x40, 0x38, 0x40, 0x3f],
+        b'X' => [0x63, 0x14, 0x08, 0x14, 0x63],
+        b'Y' => [0x07, 0x08, 0x70, 0x08, 0x07],
+        b'Z' => [0x61, 0x51, 0x49, 0x45, 0x43],
+        b'0' => [0x3e, 0x45, 0x49, 0x51, 0x3e],
+        b'1' => [0x00, 0x41, 0x7f, 0x40, 0x00],
+        b'2' => [0x62, 0x51, 0x49, 0x49, 0x46],
+        b'3' => [0x22, 0x41, 0x49, 0x49, 0x36],
+        b'4' => [0x18, 0x14, 0x12, 0x7f, 0x10],
+        b'5' => [0x2f, 0x49, 0x49, 0x49, 0x31],
+        b'6' => [0x3e, 0x49, 0x49, 0x49, 0x32],
+        b'7' => [0x01, 0x71, 0x09, 0x05, 0x03],
+        b'8' => [0x36, 0x49, 0x49, 0x49, 0x36],
+        b'9' => [0x26, 0x49, 0x49, 0x49, 0x3e],
+        b'.' => [0x00, 0x60, 0x60, 0x00, 0x00],
+        b':' => [0x00, 0x36, 0x36, 0x00, 0x00],
+        b'/' => [0x60, 0x10, 0x08, 0x04, 0x03],
+        b'-' => [0x08, 0x08, 0x08, 0x08, 0x08],
+        b'_' => [0x40, 0x40, 0x40, 0x40, 0x40],
+        b'%' => [0x63, 0x13, 0x08, 0x64, 0x63],
+        b'+' => [0x08, 0x08, 0x3e, 0x08, 0x08],
+        b'[' => [0x7f, 0x41, 0x41, 0x00, 0x00],
+        b']' => [0x00, 0x00, 0x41, 0x41, 0x7f],
+        b'=' => [0x14, 0x14, 0x14, 0x14, 0x14],
+        b' ' => [0; 5],
+        _ => [0x7f, 0x41, 0x5d, 0x41, 0x7f],
+    }
+}
+
+fn main() {
+    let mut args = std::env::args().skip(1);
+    let first = args.next();
+    let info = first.as_deref() == Some("--info");
+    let device = if info {
+        args.next().unwrap_or_else(|| "/dev/fb0".to_string())
+    } else {
+        first.unwrap_or_else(|| "/dev/fb0".to_string())
+    };
+    let mut framebuffer = match Framebuffer::open(&device) {
+        Ok(fb) => fb,
+        Err(error) => {
+            eprintln!("node-dashboard: {error}");
+            std::process::exit(1);
+        }
+    };
+    if info {
+        println!(
+            "{}x{} {}bpp line={} R{}:{} G{}:{} B{}:{} A{}:{}",
+            framebuffer.width,
+            framebuffer.height,
+            framebuffer.bits_per_pixel,
+            framebuffer.line_length,
+            framebuffer.red.offset,
+            framebuffer.red.length,
+            framebuffer.green.offset,
+            framebuffer.green.length,
+            framebuffer.blue.offset,
+            framebuffer.blue.length,
+            framebuffer.transp.offset,
+            framebuffer.transp.length,
+        );
+        return;
+    }
+    let mut dashboard = Dashboard::new();
+    loop {
+        let started = Instant::now();
+        let snapshot = dashboard.collect();
+        render(&mut framebuffer, &snapshot);
+        let elapsed = started.elapsed();
+        if elapsed < Duration::from_secs(30) {
+            thread::sleep(Duration::from_secs(30) - elapsed);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_rpc_scalars_without_a_json_dependency() {
+        let body = r#"{"blocks":960554,"headers":960574,"verificationprogress":0.9999,"initialblockdownload":false,"pruned":false,"size_on_disk":864053269491,"warnings":""}"#;
+        assert_eq!(json_u64(body, "blocks"), Some(960554));
+        assert_eq!(json_u64(body, "headers"), Some(960574));
+        assert_eq!(json_bool(body, "initialblockdownload"), Some(false));
+        assert_eq!(json_f64(body, "verificationprogress"), Some(0.9999));
+    }
+
+    #[test]
+    fn cookie_auth_encoding_is_stable() {
+        assert_eq!(base64(b"__cookie__:abc"), "X19jb29raWVfXzphYmM=");
+    }
+
+    #[test]
+    fn formatting_stays_short_for_the_frame() {
+        assert_eq!(format_uptime(90_061), "1d 01h 01m");
+        assert_eq!(format_size(864_053_269_491), "864G");
+        assert_eq!(fit("ABCDEFGHIJKLMNOPQRSTUVWXYZ", 8), "ABCDEFGH");
+    }
+}

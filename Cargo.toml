@@ -1,0 +1,17 @@
+[package]
+name = "node-experiment-dashboard"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A tiny direct-fbdev Bitcoin node dashboard for resource-constrained Linux devices."
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[[bin]]
+name = "node-dashboard"
+path = "src/main.rs"
