@@ -756,12 +756,16 @@ impl Rpc {
             .split_once("\r\n\r\n")
             .map(|(_, body)| body)
             .ok_or_else(|| "bad HTTP response".to_string())?;
-        if body.contains("\"error\":null") || body.contains("\"result\":") {
+        if rpc_succeeded(body) {
             Ok(body.to_string())
         } else {
             Err("RPC error".to_string())
         }
     }
+}
+
+fn rpc_succeeded(body: &str) -> bool {
+    body.contains("\"error\":null")
 }
 
 fn read_text(path: &str) -> Option<String> {
@@ -1480,6 +1484,16 @@ mod tests {
         assert_eq!(json_u64(body, "headers"), Some(960574));
         assert_eq!(json_bool(body, "initialblockdownload"), Some(false));
         assert_eq!(json_f64(body, "verificationprogress"), Some(0.9999));
+    }
+
+    #[test]
+    fn rejects_warming_up_rpc_errors() {
+        assert!(rpc_succeeded(
+            r#"{"result":{"blocks":1},"error":null,"id":"dash"}"#
+        ));
+        assert!(!rpc_succeeded(
+            r#"{"result":null,"error":{"code":-28},"id":"dash"}"#
+        ));
     }
 
     #[test]
