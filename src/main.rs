@@ -602,11 +602,22 @@ impl ChainCache {
         }
     }
 
+    fn retain_mempool(mut node: Node, previous: Option<&Node>) -> Node {
+        if !node.mempool.available
+            && let Some(previous) = previous
+            && previous.mempool.available
+        {
+            node.mempool = previous.mempool.clone();
+        }
+        node
+    }
+
     fn collect(&mut self, network_cache: &mut NetworkCache) -> Node {
         let now = Instant::now();
         if now >= self.next_poll {
             self.next_poll = now + Duration::from_secs(CHAIN_POLL_SECS);
-            self.snapshot = Some(Node::poll(network_cache));
+            let polled = Node::poll(network_cache);
+            self.snapshot = Some(Self::retain_mempool(polled, self.snapshot.as_ref()));
         }
         let mut node = self.snapshot.clone().unwrap_or_else(Node::unavailable);
         let core_rss = core_process_rss_kib();
@@ -1443,6 +1454,24 @@ mod tests {
         assert_eq!(mempool.limit, 5_000_000);
         assert_eq!(mempool.min_fee, 0.00001);
         assert_eq!(mempool.unbroadcast, 2);
+    }
+
+    #[test]
+    fn retains_the_last_mempool_result_after_a_failed_poll() {
+        let mut previous = Node::unavailable();
+        previous.mempool = Mempool::from_rpc(
+            r#"{"size":17,"bytes":4920,"usage":18432,"maxmempool":5000000,"mempoolminfee":0.00001000,"unbroadcastcount":2}"#,
+        );
+
+        let retained = ChainCache::retain_mempool(Node::unavailable(), Some(&previous));
+        assert!(retained.mempool.available);
+        assert_eq!(retained.mempool.entries, 17);
+        assert_eq!(retained.mempool.usage, 18_432);
+        assert!(
+            !ChainCache::retain_mempool(Node::unavailable(), None)
+                .mempool
+                .available
+        );
     }
 
     #[test]
