@@ -33,6 +33,12 @@ stop_pid() {
 }
 
 case "${1-}" in
+  stop-core)
+    if pid=$(matching_pid "$core_pidfile" "$runtime/bin/bitcoind"); then
+      stop_pid "$pid"
+    fi
+    rm -f "$core_pidfile"
+    ;;
   bmc)
     if pid=$(matching_pid "$core_pidfile" "$runtime/bin/bitcoind"); then
       stop_pid "$pid"

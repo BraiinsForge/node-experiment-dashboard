@@ -1370,6 +1370,34 @@ fn glyph(byte: u8) -> [u8; 5] {
     }
 }
 
+fn render_shutdown(fb: &mut Framebuffer) {
+    let scale = if fb.width >= 600 && fb.height >= 400 {
+        2
+    } else {
+        1
+    };
+    let margin = 12 * scale;
+    fb.fill(BLACK);
+    fb.rect(0, 0, fb.width, 30 * scale, PANEL_ALT);
+    fb.rect(0, 29 * scale, fb.width, scale, BLUE);
+    fb.text(margin, 8 * scale, "BITCOIN NODE", scale, WHITE);
+    fb.text(margin, 105 * scale, "SHUTTING DOWN NODE", 3 * scale, WHITE);
+    fb.text(
+        margin,
+        160 * scale,
+        "WAITING FOR CORE TO FINISH",
+        2 * scale,
+        MUTED,
+    );
+    fb.text(
+        margin,
+        195 * scale,
+        "BMC MODE WILL START AUTOMATICALLY",
+        2 * scale,
+        CYAN,
+    );
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let first = args.next();
@@ -1406,16 +1434,33 @@ fn main() {
     }
     let mut dashboard = Dashboard::new();
     let mut touch = Touch::open();
+    let mut shutting_down = false;
     loop {
+        if shutting_down {
+            render_shutdown(&mut framebuffer);
+            framebuffer.publish();
+            if core_process_rss_kib().is_none() {
+                let _ = Command::new("/mnt/bitcoin-node/runtime/node-mode")
+                    .arg("bmc")
+                    .spawn();
+                break;
+            }
+            thread::sleep(Duration::from_secs(1));
+            continue;
+        }
+
         let started = Instant::now();
         let snapshot = dashboard.collect();
         render(&mut framebuffer, &snapshot, &dashboard.history);
         framebuffer.publish();
-        if touch.as_mut().is_some_and(Touch::bmc_pressed) {
-            let _ = Command::new("/mnt/bitcoin-node/runtime/node-mode")
-                .arg("bmc")
-                .spawn();
-            break;
+        if touch.as_mut().is_some_and(Touch::bmc_pressed)
+            && Command::new("/mnt/bitcoin-node/runtime/node-mode")
+                .arg("stop-core")
+                .spawn()
+                .is_ok()
+        {
+            shutting_down = true;
+            continue;
         }
         let elapsed = started.elapsed();
         if elapsed < Duration::from_secs(DASHBOARD_TICK_SECS) {
