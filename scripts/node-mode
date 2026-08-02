@@ -1,0 +1,70 @@
+#!/bin/sh
+
+runtime=/mnt/bitcoin-node/runtime
+core_pidfile=$runtime/bitcoind.pid
+dashboard_pidfile=$runtime/node-dashboard.pid
+
+command_for_pid() {
+  [ -r "/proc/$1/cmdline" ] || return 1
+  cat "/proc/$1/cmdline" 2>/dev/null | tr '\000' ' '
+}
+
+recorded_pid() {
+  [ -r "$1" ] || return 1
+  pid=$(cat "$1" 2>/dev/null) || return 1
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  command=$(command_for_pid "$pid") || return 1
+  case "$command" in *"$2"*) printf '%s\n' "$pid" ;; *) return 1 ;; esac
+}
+
+matching_pid() {
+  recorded_pid "$1" "$2" && return 0
+  for directory in /proc/[0-9]*; do
+    pid=${directory#/proc/}
+    command=$(command_for_pid "$pid") || continue
+    case "$command" in *"$2"*) printf '%s\n' "$pid"; return 0 ;; esac
+  done
+  return 1
+}
+
+stop_pid() {
+  pid=$1
+  kill -TERM "$pid" 2>/dev/null || :
+}
+
+case "${1-}" in
+  bmc)
+    if pid=$(matching_pid "$core_pidfile" "$runtime/bin/bitcoind"); then
+      stop_pid "$pid"
+    fi
+    if pid=$(matching_pid "$dashboard_pidfile" "$runtime/node-dashboard"); then
+      stop_pid "$pid"
+    fi
+    rm -f "$core_pidfile" "$dashboard_pidfile"
+    sleep 1
+    exec /etc/init.d/bmc-compositor start
+    ;;
+  node)
+    /etc/init.d/bmc-compositor stop
+    sleep 1
+    if ! matching_pid "$core_pidfile" "$runtime/bin/bitcoind" >/dev/null; then
+      nohup "$runtime/lib/ld-linux-armhf.so.3" --library-path "$runtime/lib" \
+        "$runtime/bin/bitcoind" -datadir=/mnt/bitcoin-node \
+        -conf=/mnt/bitcoin-node/bitcoin.conf -daemon=0 \
+        </dev/null >>"$runtime/bitcoind-final.log" 2>&1 &
+      echo "$!" >"$core_pidfile"
+    fi
+    echo "$$" >"$dashboard_pidfile"
+    attempt=0
+    while :; do
+      "$runtime/node-dashboard" /dev/fb0 && exit 0
+      attempt=$((attempt + 1))
+      [ "$attempt" -lt 30 ] || exit 1
+      sleep 1
+    done
+    ;;
+  *)
+    echo "usage: node-mode bmc or node" >&2
+    exit 64
+    ;;
+esac
